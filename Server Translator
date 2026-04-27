@@ -1,0 +1,90 @@
+import cv2
+import socket
+import time
+import numpy as np
+from ultralytics import YOLO
+
+# --- NETWORK CONFIG ---
+# Listen for the Laptop on port 5000
+UDP_IP = "0.0.0.0" 
+UDP_PORT = 5000
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False) # Non-blocking so camera doesn't freeze
+
+laptop_address = None # We will save the laptop's IP when it says hello
+last_send_time = time.time()
+
+# --- AI MODELS ---
+print("Loading AI Models on GX10...")
+model_pose = YOLO("yolov8n-pose.pt")
+model_obj = YOLO("yolov8n.pt")
+
+target_class = "person" # Default
+cap = cv2.VideoCapture(0)
+
+print(f"GX10 AI Server Online. Listening on {UDP_PORT}...")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    frame = cv2.flip(frame, 1)
+
+    # 1. CHECK FOR NETWORK COMMANDS FROM LAPTOP
+    try:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode('utf-8').strip()
+        laptop_address = addr # Save Laptop IP to reply
+        
+        if msg.startswith("target:"):
+            target_class = msg.split(":")[1].lower()
+            print(f">>> New Target Assigned: {target_class.upper()} <<<")
+    except BlockingIOError:
+        pass # No new network messages, continue processing
+
+    tx, ty = 320, 240
+    found = False
+
+    # 2. RUN AI DETECTION
+    if target_class == "person":
+        results = model_pose.predict(frame, verbose=False, conf=0.5)
+        if results and results[0].keypoints:
+            kps = results[0].keypoints.xy.cpu().numpy()
+            for person in kps:
+                if len(person) > 0 and person[0][0] > 0:
+                    tx, ty = int(person[0][0]), int(person[0][1])
+                    found = True
+                    cv2.circle(frame, (tx, ty), 8, (0, 0, 255), -1)
+                    break
+    else:
+        results = model_obj.predict(frame, verbose=False, conf=0.5)
+        if results and results[0].boxes:
+            for box in results[0].boxes:
+                cls_id = int(box.cls[0])
+                cls_name = model_obj.names[cls_id]
+                if cls_name == target_class:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    tx = int((x1 + x2) / 2)
+                    ty = int((y1 + y2) / 2)
+                    found = True
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
+                    cv2.circle(frame, (tx, ty), 5, (0, 0, 255), -1)
+                    break
+
+    # 3. SEND DATA TO LAPTOP (Throttled to 5Hz)
+    now = time.time()
+    if laptop_address and (now - last_send_time) >= 0.2: # 0.2s = 5Hz
+        # Format: x,y,found(1 or 0)
+        packet = f"{tx},{ty},{1 if found else 0}"
+        sock.sendto(packet.encode('utf-8'), laptop_address)
+        last_send_time = now
+
+    # 4. UI RENDER (On GX10 Monitor)
+    cv2.putText(frame, f"TARGET: {target_class.upper()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(frame, "Waiting for Laptop..." if not laptop_address else "Connected to Laptop", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+    cv2.imshow("GX10 AI Processing", frame)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()
