@@ -1,0 +1,123 @@
+import serial
+import time
+import socket
+import numpy as np
+import threading
+
+# --- CONFIGURATION ---
+SERIAL_PORT = '/dev/ttyACM0'
+GX10_IP = '10.10.1.40'
+GX10_PORT = 5000
+CENTER_X, CENTER_Y = 320, 240
+MAX_ACCEL = 30.0
+
+# PID State
+pid = {'p': 1.2, 'i': 0.01, 'd': 0.18}
+last_error_x, last_error_y = 0, 0
+error_sum_x, error_sum_y = 0, 0
+actual_vel_x, actual_vel_y = 0.0, 0.0
+
+# --- NETWORK SETUP ---
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# Timeout acts as our 5Hz frame-limiter based on GX10's broadcast rate
+sock.settimeout(0.3) 
+
+# --- HARDWARE SETUP ---
+try:
+    esp32 = serial.Serial(SERIAL_PORT, 921600, timeout=0)
+except Exception as e:
+    print(f"Error connecting to ESP32 on {SERIAL_PORT}. Ensure it's plugged in!")
+    exit()
+
+# --- CONSOLE THREAD ---
+def input_thread():
+    """Waits for user input to swap AI targets"""
+    while True:
+        try:
+            new_target = input("\n[CONSOLE] Enter target (e.g., 'person', 'cup', 'dog'):\n").strip()
+            if new_target:
+                # Send the command to the GX10 to switch YOLO models
+                sock.sendto(f"target:{new_target}".encode('utf-8'), (GX10_IP, GX10_PORT))
+                print(f"Sent command to GX10 -> Target: {new_target.upper()}")
+        except:
+            pass
+
+threading.Thread(target=input_thread, daemon=True).start()
+
+# Tell GX10 we are online so it registers our IP and starts sending data
+print(f"Connecting to GX10 AI at {GX10_IP}...")
+sock.sendto(b"target:person", (GX10_IP, GX10_PORT))
+
+print("Bridge Active. Handling PID and ESP32 Communiations at 5Hz.")
+last_time = time.time()
+
+while True:
+    try:
+        # Blocks until the GX10 sends the next 5Hz frame
+        data, addr = sock.recvfrom(1024) 
+        msg = data.decode('utf-8').split(',')
+        
+        tx = int(msg[0])
+        ty = int(msg[1])
+        found = bool(int(msg[2]))
+        
+    except socket.timeout:
+        # GX10 disconnected or lagging
+        found = False
+        tx, ty = CENTER_X, CENTER_Y
+
+    # Timing for PID
+    now = time.time()
+    dt = now - last_time
+    if dt == 0: dt = 0.001
+    last_time = now
+
+    # --- POWER-CURVE PID MATH ---
+    vel_x, vel_y = 0, 0
+    dir_x, dir_y = 1, 1
+    
+    if found:
+        err_x = tx - CENTER_X
+        err_y = ty - CENTER_Y
+        
+        # Power Curve (Exponential boost for far targets)
+        p_curve_x = np.sign(err_x) * (abs(err_x) ** 1.1)
+        p_curve_y = np.sign(err_y) * (abs(err_y) ** 1.1)
+
+        # Calculate PID
+        error_sum_x += err_x * dt
+        deriv_x = (err_x - last_error_x) / dt if dt > 0 else 0
+        out_x = (pid['p'] * p_curve_x) + (pid['i'] * error_sum_x) + (pid['d'] * deriv_x)
+
+        error_sum_y += err_y * dt
+        deriv_y = (err_y - last_error_y) / dt if dt > 0 else 0
+        out_y = (pid['p'] * p_curve_y) + (pid['i'] * error_sum_y) + (pid['d'] * deriv_y)
+
+        # Scale for ESP32 mapping
+        target_vel_x = int(np.clip(abs(out_x) * 5, 0, 255))
+        dir_x = 1 if out_x > 0 else 2
+
+        target_vel_y = int(np.clip(abs(out_y) * 5, 0, 255))
+        dir_y = 1 if out_y > 0 else 2
+        
+        # Acceleration Smoothing to prevent vibration
+        speed_diff_x = target_vel_x - actual_vel_x
+        if abs(speed_diff_x) > MAX_ACCEL: actual_vel_x += np.sign(speed_diff_x) * MAX_ACCEL
+        else: actual_vel_x = target_vel_x
+            
+        speed_diff_y = target_vel_y - actual_vel_y
+        if abs(speed_diff_y) > MAX_ACCEL: actual_vel_y += np.sign(speed_diff_y) * MAX_ACCEL
+        else: actual_vel_y = target_vel_y
+            
+        vel_x, vel_y = int(actual_vel_x), int(actual_vel_y)
+        last_error_x, last_error_y = err_x, err_y
+        
+    else:
+        # Smooth braking when target is lost
+        error_sum_x, error_sum_y = 0, 0
+        if actual_vel_x > 0: actual_vel_x = max(0, actual_vel_x - MAX_ACCEL * 1.5)
+        if actual_vel_y > 0: actual_vel_y = max(0, actual_vel_y - MAX_ACCEL * 1.5)
+        vel_x, vel_y = int(actual_vel_x), int(actual_vel_y)
+
+    # Send directly to C6 Firmware
+    esp32.write(f"{dir_x},{vel_x},{dir_y},{vel_y}\n".encode())
