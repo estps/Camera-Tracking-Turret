@@ -1,0 +1,81 @@
+#include <Arduino.h>
+
+// --- PIN DEFINITIONS ---
+#define YAW_STEP 23
+#define YAW_DIR 15
+
+#define PITCH_STEP 21
+#define PITCH_DIR 22
+
+// Motor state tracking
+unsigned long lastMicrosX = 0;
+unsigned long lastMicrosY = 0;
+
+int stepDelayX = 0;
+int stepDelayY = 0;
+
+bool stepStateX = LOW;
+bool stepStateY = LOW;
+
+void setup() {
+  // Back to high-speed AI communication
+  Serial.begin(921600);
+
+  pinMode(YAW_STEP, OUTPUT);
+  pinMode(YAW_DIR, OUTPUT);
+  pinMode(PITCH_STEP, OUTPUT);
+  pinMode(PITCH_DIR, OUTPUT);
+
+  digitalWrite(YAW_STEP, LOW);
+  digitalWrite(PITCH_STEP, LOW);
+}
+
+void loop() {
+  // 1. NON-BLOCKING SERIAL READ
+  if (Serial.available() > 0) {
+    String data = Serial.readStringUntil('\n');
+
+    int comma1 = data.indexOf(',');
+    int comma2 = data.indexOf(',', comma1 + 1);
+    int comma3 = data.indexOf(',', comma2 + 1);
+
+    if (comma1 != -1 && comma2 != -1 && comma3 != -1) {
+      int dirX = data.substring(0, comma1).toInt();
+      int spdX = data.substring(comma1 + 1, comma2).toInt();
+      int dirY = data.substring(comma2 + 1, comma3).toInt();
+      int spdY = data.substring(comma3 + 1).toInt();
+
+      // Apply Directions
+      digitalWrite(YAW_DIR, (dirX == 1) ? HIGH : LOW);
+      digitalWrite(PITCH_DIR, (dirY == 1) ? HIGH : LOW);
+
+      // --- THE MAGIC BULLETPROOF MAPPING ---
+      // 0 speed = stopped (0)
+      // 1 speed (slowest) = 2000us
+      // 255 speed (fastest) = 160us (Your safe limit!)
+      stepDelayX = (spdX == 0) ? 0 : map(spdX, 0, 255, 2000, 220
+      stepDelayY = (spdY == 0) ? 0 : map(spdY, 0, 255, 2000, 160
+    }
+  }
+
+  // 2. CONSTANT NON-BLOCKING PULSES
+  unsigned long currentMicros = micros();
+
+  // YAW (X-Axis) Stepping
+  if (stepDelayX > 0) {
+    if (currentMicros - lastMicrosX >= stepDelayX) {
+      lastMicrosX = currentMicros;
+      stepStateX = !stepStateX;
+      digitalWrite(YAW_STEP, stepStateX);
+    }
+  }
+
+  // PITCH (Y-Axis) Stepping
+  if (stepDelayY > 0) {
+    if (currentMicros - lastMicrosY >= stepDelayY) {
+      lastMicrosY = currentMicros;
+      stepStateY = !stepStateY;
+      digitalWrite(PITCH_STEP, stepStateY);
+    }
+  }
+}
