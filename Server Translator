@@ -1,90 +1,91 @@
 import cv2
 import socket
-import time
+import struct
 import numpy as np
 from ultralytics import YOLO
 
-# --- NETWORK CONFIG ---
-# Listen for the Laptop on port 5000
-UDP_IP = "0.0.0.0" 
-UDP_PORT = 5000
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-sock.setblocking(False) # Non-blocking so camera doesn't freeze
+HOST = '0.0.0.0'
+PORT = 5000
 
-laptop_address = None # We will save the laptop's IP when it says hello
-last_send_time = time.time()
+print("Loading YOLO11 Models on GX10 GPU (FP16 Mode)...")
+model_pose = YOLO("yolo11n-pose.pt") 
+model_obj = YOLO("yolo11x.pt")       
 
-# --- AI MODELS ---
-print("Loading AI Models on GX10...")
-model_pose = YOLO("yolov8n-pose.pt")
-model_obj = YOLO("yolov8n.pt")
+def recvall(sock, count):
+    buf = b''
+    while count > 0:
+        newbuf = sock.recv(count)
+        if not newbuf: return None
+        buf += newbuf
+        count -= len(newbuf)
+    return buf
 
-target_class = "person" # Default
-cap = cv2.VideoCapture(0)
+print(f"GX10 Server Online. Listening on Port {PORT}...")
 
-print(f"GX10 AI Server Online. Listening on {UDP_PORT}...")
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
+server_socket.bind((HOST, PORT))
+server_socket.listen(1)
 
 while True:
-    ret, frame = cap.read()
-    if not ret: break
-    frame = cv2.flip(frame, 1)
+    print("\nWaiting for Laptop to connect...")
+    conn, addr = server_socket.accept()
+    print(f"Laptop Connected from: {addr}")
 
-    # 1. CHECK FOR NETWORK COMMANDS FROM LAPTOP
     try:
-        data, addr = sock.recvfrom(1024)
-        msg = data.decode('utf-8').strip()
-        laptop_address = addr # Save Laptop IP to reply
-        
-        if msg.startswith("target:"):
-            target_class = msg.split(":")[1].lower()
-            print(f">>> New Target Assigned: {target_class.upper()} <<<")
-    except BlockingIOError:
-        pass # No new network messages, continue processing
+        while True:
+            header = recvall(conn, 20)
+            if not header: break 
 
-    tx, ty = 320, 240
-    found = False
+            target_class_raw = header[:16].decode('utf-8').strip('\x00')
+            frame_size = struct.unpack('<I', header[16:20])[0]
 
-    # 2. RUN AI DETECTION
-    if target_class == "person":
-        results = model_pose.predict(frame, verbose=False, conf=0.5)
-        if results and results[0].keypoints:
-            kps = results[0].keypoints.xy.cpu().numpy()
-            for person in kps:
-                if len(person) > 0 and person[0][0] > 0:
-                    tx, ty = int(person[0][0]), int(person[0][1])
-                    found = True
-                    cv2.circle(frame, (tx, ty), 8, (0, 0, 255), -1)
-                    break
-    else:
-        results = model_obj.predict(frame, verbose=False, conf=0.5)
-        if results and results[0].boxes:
-            for box in results[0].boxes:
-                cls_id = int(box.cls[0])
-                cls_name = model_obj.names[cls_id]
-                if cls_name == target_class:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    tx = int((x1 + x2) / 2)
-                    ty = int((y1 + y2) / 2)
-                    found = True
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
-                    cv2.circle(frame, (tx, ty), 5, (0, 0, 255), -1)
-                    break
+            frame_data = recvall(conn, frame_size)
+            if not frame_data: break
 
-    # 3. SEND DATA TO LAPTOP (Throttled to 5Hz)
-    now = time.time()
-    if laptop_address and (now - last_send_time) >= 0.2: # 0.2s = 5Hz
-        # Format: x,y,found(1 or 0)
-        packet = f"{tx},{ty},{1 if found else 0}"
-        sock.sendto(packet.encode('utf-8'), laptop_address)
-        last_send_time = now
+            np_arr = np.frombuffer(frame_data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # 4. UI RENDER (On GX10 Monitor)
-    cv2.putText(frame, f"TARGET: {target_class.upper()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, "Waiting for Laptop..." if not laptop_address else "Connected to Laptop", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-    cv2.imshow("GX10 AI Processing", frame)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+            h, w = frame.shape[:2]
+            tx, ty, found = w // 2, h // 2, 0 
+            boxes_data = "" 
 
-cap.release()
-cv2.destroyAllWindows()
+            target_list = [t.strip() for t in target_class_raw.split(',')]
+            is_pose_mode = "person" in target_list
+
+            if is_pose_mode:
+                results = model_pose.predict(frame, verbose=False, conf=0.45, half=True)
+                if results and results[0].keypoints:
+                    kps = results[0].keypoints.xy.cpu().numpy()
+                    confs = results[0].keypoints.conf.cpu().numpy() if results[0].keypoints.conf is not None else [0.9] * len(kps)
+                    for i, person in enumerate(kps):
+                        if len(person) > 0 and person[0][0] > 0:
+                            tx, ty = int(person[0][0]), int(person[0][1])
+                            found = 1
+
+                            conf = confs[i][0] if hasattr(confs[i], "__len__") else 0.9
+                            boxes_data += f"person,{tx-50},{ty-50},{tx+50},{ty+50},{conf:.2f};"
+                            break
+            else:
+                results = model_obj.predict(frame, verbose=False, conf=0.45, half=True)
+                if results and results[0].boxes:
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls[0])
+                        cls_name = model_obj.names[cls_id]
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+
+                        boxes_data += f"{cls_name},{int(x1)},{int(y1)},{int(x2)},{int(y2)},{conf:.2f};"
+
+                        if cls_name in target_list and not found:
+                            tx = int((x1 + x2) / 2)
+                            ty = int((y1 + y2) / 2)
+                            found = 1
+
+            reply = f"{tx},{ty},{found}|{boxes_data}\n"
+            conn.sendall(reply.encode('utf-8'))
+
+    except Exception as e:
+        print(f"\nConnection error: {e}")
+    finally:
+        conn.close()
