@@ -1,24 +1,23 @@
 #include <Arduino.h>
 
-// --- PIN DEFINITIONS ---
 #define YAW_STEP 23
 #define YAW_DIR 15
 
 #define PITCH_STEP 21
 #define PITCH_DIR 22
 
-// Motor state tracking
 unsigned long lastMicrosX = 0;
 unsigned long lastMicrosY = 0;
 
-int stepDelayX = 0;
-int stepDelayY = 0;
+int targetStepsX = 0;
+int targetStepsY = 0;
 
 bool stepStateX = LOW;
 bool stepStateY = LOW;
 
+int stepDelay = 300; 
+
 void setup() {
-  // Back to high-speed AI communication
   Serial.begin(921600);
 
   pinMode(YAW_STEP, OUTPUT);
@@ -31,7 +30,7 @@ void setup() {
 }
 
 void loop() {
-  // 1. NON-BLOCKING SERIAL READ
+
   if (Serial.available() > 0) {
     String data = Serial.readStringUntil('\n');
 
@@ -41,41 +40,42 @@ void loop() {
 
     if (comma1 != -1 && comma2 != -1 && comma3 != -1) {
       int dirX = data.substring(0, comma1).toInt();
-      int spdX = data.substring(comma1 + 1, comma2).toInt();
-      int dirY = data.substring(comma2 + 1, comma3).toInt();
-      int spdY = data.substring(comma3 + 1).toInt();
+      int incomingStepsX = data.substring(comma1 + 1, comma2).toInt();
 
-      // Apply Directions
+      int dirY = data.substring(comma2 + 1, comma3).toInt();
+      int incomingStepsY = data.substring(comma3 + 1).toInt();
+
       digitalWrite(YAW_DIR, (dirX == 1) ? HIGH : LOW);
       digitalWrite(PITCH_DIR, (dirY == 1) ? HIGH : LOW);
 
-      // --- THE MAGIC BULLETPROOF MAPPING ---
-      // 0 speed = stopped (0)
-      // 1 speed (slowest) = 2000us
-      // 255 speed (fastest) = 160us (Your safe limit!)
-      stepDelayX = (spdX == 0) ? 0 : map(spdX, 0, 255, 2000, 220
-      stepDelayY = (spdY == 0) ? 0 : map(spdY, 0, 255, 2000, 160
+      targetStepsX = incomingStepsX;
+      targetStepsY = incomingStepsY;
     }
   }
 
-  // 2. CONSTANT NON-BLOCKING PULSES
   unsigned long currentMicros = micros();
 
-  // YAW (X-Axis) Stepping
-  if (stepDelayX > 0) {
-    if (currentMicros - lastMicrosX >= stepDelayX) {
+  if (targetStepsX > 0) {
+    if (currentMicros - lastMicrosX >= stepDelay) {
       lastMicrosX = currentMicros;
       stepStateX = !stepStateX;
       digitalWrite(YAW_STEP, stepStateX);
+
+      if (stepStateX == LOW) {
+        targetStepsX--;
+      }
     }
   }
 
-  // PITCH (Y-Axis) Stepping
-  if (stepDelayY > 0) {
-    if (currentMicros - lastMicrosY >= stepDelayY) {
+  if (targetStepsY > 0) {
+    if (currentMicros - lastMicrosY >= stepDelay) {
       lastMicrosY = currentMicros;
       stepStateY = !stepStateY;
       digitalWrite(PITCH_STEP, stepStateY);
+
+      if (stepStateY == LOW) {
+        targetStepsY--;
+      }
     }
   }
 }
