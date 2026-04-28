@@ -1,123 +1,336 @@
+import cv2
 import serial
-import time
 import socket
+import struct
+import time
 import numpy as np
 import threading
+import queue
+import pyttsx3
+import math
 
-# --- CONFIGURATION ---
+cv2.setNumThreads(8)
+
 SERIAL_PORT = '/dev/ttyACM0'
-GX10_IP = '10.10.1.40'
+GX10_IP = 'IP'
 GX10_PORT = 5000
+
+GEAR_RATIO_X = 166.0 / 24.0
+GEAR_RATIO_Y = 60.0 / 20.0
+
+FOV_X = 55.0
+FOV_Y = 43.0
+
+STEPS_PER_REV = 400.0
+DEG_PER_STEP = 360.0 / STEPS_PER_REV  
+
+STEP_DELAY_MS = 0.6 
+
+INVERT_X = True
+INVERT_Y = False
+
 CENTER_X, CENTER_Y = 320, 240
-MAX_ACCEL = 30.0
+DEADZONE_PX = 8  
 
-# PID State
-pid = {'p': 1.2, 'i': 0.01, 'd': 0.18}
-last_error_x, last_error_y = 0, 0
-error_sum_x, error_sum_y = 0, 0
-actual_vel_x, actual_vel_y = 0.0, 0.0
+target_class = "person"
 
-# --- NETWORK SETUP ---
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-# Timeout acts as our 5Hz frame-limiter based on GX10's broadcast rate
-sock.settimeout(0.3) 
+abs_pos_x = 0 
 
-# --- HARDWARE SETUP ---
-try:
-    esp32 = serial.Serial(SERIAL_PORT, 921600, timeout=0)
-except Exception as e:
-    print(f"Error connecting to ESP32 on {SERIAL_PORT}. Ensure it's plugged in!")
-    exit()
+abs_pos_y = 0
 
-# --- CONSOLE THREAD ---
-def input_thread():
-    """Waits for user input to swap AI targets"""
+ai_data = {
+    'tx': CENTER_X,
+    'ty': CENTER_Y,
+    'found': False,
+    'boxes': [],
+    'new_frame': None,
+    'in_flight': 0,
+    'kb_sent': 0,
+    'lock': threading.Lock()
+}
+
+audio_queue = queue.Queue()
+def audio_worker():
+    engine = None
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 180)
+    except:
+        print("[ERROR] TTS Engine failed to initialize")
+        pass
+
     while True:
-        try:
-            new_target = input("\n[CONSOLE] Enter target (e.g., 'person', 'cup', 'dog'):\n").strip()
-            if new_target:
-                # Send the command to the GX10 to switch YOLO models
-                sock.sendto(f"target:{new_target}".encode('utf-8'), (GX10_IP, GX10_PORT))
-                print(f"Sent command to GX10 -> Target: {new_target.upper()}")
-        except:
-            pass
+        m, content = audio_queue.get()
+        if engine:
+            if m == 'ding':
+                print("\a")
+                engine.say("Locked")
+            elif m == 'desc':
+                name, conf = content
+                conf_pct = int(conf * 100)
+                engine.say(f"I see a {name} with {conf_pct} percent confidence")
+            engine.runAndWait()
+        audio_queue.task_done()
 
+threading.Thread(target=audio_worker, daemon=True).start()
+
+class CameraStream:
+    def __init__(self, index=2):
+        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FPS, 60)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+
+        self.ret, self.frame = False, None
+        self.started = False
+        self.read_lock = threading.Lock()
+        self.new_frame_event = threading.Event()
+
+    def start(self):
+        if self.started: return self
+        self.started = True
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.started:
+            self.cap.grab()
+            ret, frame = self.cap.retrieve()
+            if ret:
+                with self.read_lock:
+                    self.ret, self.frame = ret, frame
+                self.new_frame_event.set()
+            else:
+                time.sleep(0.001)
+
+    def read(self):
+        if not self.new_frame_event.wait(timeout=0.1):
+            with self.read_lock: return self.ret, self.frame
+        self.new_frame_event.clear()
+        with self.read_lock:
+            return self.ret, self.frame
+
+    def stop(self):
+        self.started = False
+        self.thread.join()
+        self.cap.release()
+
+def gx10_worker():
+    sock = None
+    def connect():
+        nonlocal sock
+        while True:
+            try:
+                if sock: sock.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(2.0)
+                sock.connect((GX10_IP, GX10_PORT))
+                sock.settimeout(None)
+                print("GX10 Connected.")
+                return sock
+            except: time.sleep(1)
+
+    sock = connect()
+
+    def receiver(current_sock):
+        buffer = ""
+        while True:
+            try:
+                chunk = current_sock.recv(4096).decode('utf-8')
+                if not chunk: break
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if "|" in line:
+                        parts = line.split('|')
+                        main = parts[0].split(',')
+                        new_tx, new_ty, new_found = int(main[0]), int(main[1]), bool(int(main[2]))
+
+                        boxes = []
+                        if len(parts) > 1 and parts[1]:
+                            for b in parts[1].split(';'):
+                                if not b: continue
+                                bp = b.split(',')
+                                if len(bp) >= 5:
+                                    try:
+                                        coords = [int(float(v)) for v in bp[1:5]]
+                                        conf = float(bp[5]) if len(bp) >= 6 else 1.0
+                                        boxes.append((bp[0], coords, conf))
+                                    except:
+                                        pass
+
+                        with ai_data['lock']:
+                            ai_data['tx'], ai_data['ty'], ai_data['found'] = new_tx, new_ty, new_found
+                            ai_data['boxes'] = boxes
+                            if ai_data['in_flight'] > 0: ai_data['in_flight'] -= 1
+            except: break
+
+    recv_thread = threading.Thread(target=receiver, args=(sock,), daemon=True)
+    recv_thread.start()
+
+    while True:
+        frame = None
+        with ai_data['lock']:
+            if ai_data['new_frame'] is not None:
+                frame = ai_data['new_frame']
+                ai_data['new_frame'] = None
+        if frame is None:
+            time.sleep(0.001); continue
+        try:
+            with ai_data['lock']: flights = ai_data['in_flight']
+            if flights < 2:
+                _, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                img_data = enc.tobytes()
+                header = target_class.encode('utf-8').ljust(16, b'\x00')[:16] + struct.pack('<I', len(img_data))
+                sock.sendall(header + img_data)
+                with ai_data['lock']:
+                    ai_data['kb_sent'] = len(img_data) / 1024
+                    ai_data['in_flight'] += 1
+        except:
+            sock = connect()
+            with ai_data['lock']: ai_data['in_flight'] = 0
+            threading.Thread(target=receiver, args=(sock,), daemon=True).start()
+
+threading.Thread(target=gx10_worker, daemon=True).start()
+
+def input_thread():
+    global target_class
+    while True:
+        t = input().strip().lower()
+        if t: target_class = t
 threading.Thread(target=input_thread, daemon=True).start()
 
-# Tell GX10 we are online so it registers our IP and starts sending data
-print(f"Connecting to GX10 AI at {GX10_IP}...")
-sock.sendto(b"target:person", (GX10_IP, GX10_PORT))
+esp32 = None
+try:
+    esp32 = serial.Serial(SERIAL_PORT, 921600, timeout=0)
+    print(f"ESP32 Connected on {SERIAL_PORT}")
+except:
+    print(f"ESP32 Not Connected on {SERIAL_PORT}. Continuing in simulation mode.")
 
-print("Bridge Active. Handling PID and ESP32 Communiations at 5Hz.")
+cam = CameraStream(index=2).start()
 last_time = time.time()
+last_tts_time = 0
+fps_smoothing = 0.9
+current_fps = 60.0
+
+steps_x, steps_y = 0, 0
 
 while True:
-    try:
-        # Blocks until the GX10 sends the next 5Hz frame
-        data, addr = sock.recvfrom(1024) 
-        msg = data.decode('utf-8').split(',')
-        
-        tx = int(msg[0])
-        ty = int(msg[1])
-        found = bool(int(msg[2]))
-        
-    except socket.timeout:
-        # GX10 disconnected or lagging
-        found = False
-        tx, ty = CENTER_X, CENTER_Y
+    loop_start = time.time()
+    ret, frame_raw = cam.read()
+    if not ret or frame_raw is None: continue
+    with ai_data['lock']: ai_data['new_frame'] = frame_raw
+    with ai_data['lock']:
+        tx, ty, found = ai_data['tx'], ai_data['ty'], ai_data['found']
+        boxes, flights, kb_size = ai_data['boxes'], ai_data['in_flight'], ai_data['kb_sent']
 
-    # Timing for PID
     now = time.time()
     dt = now - last_time
-    if dt == 0: dt = 0.001
     last_time = now
 
-    # --- POWER-CURVE PID MATH ---
-    vel_x, vel_y = 0, 0
     dir_x, dir_y = 1, 1
-    
+    steps_x, steps_y = 0, 0
+
     if found:
-        err_x = tx - CENTER_X
-        err_y = ty - CENTER_Y
-        
-        # Power Curve (Exponential boost for far targets)
-        p_curve_x = np.sign(err_x) * (abs(err_x) ** 1.1)
-        p_curve_y = np.sign(err_y) * (abs(err_y) ** 1.1)
 
-        # Calculate PID
-        error_sum_x += err_x * dt
-        deriv_x = (err_x - last_error_x) / dt if dt > 0 else 0
-        out_x = (pid['p'] * p_curve_x) + (pid['i'] * error_sum_x) + (pid['d'] * deriv_x)
+        err_x_px = tx - CENTER_X
+        err_y_px = ty - CENTER_Y
 
-        error_sum_y += err_y * dt
-        deriv_y = (err_y - last_error_y) / dt if dt > 0 else 0
-        out_y = (pid['p'] * p_curve_y) + (pid['i'] * error_sum_y) + (pid['d'] * deriv_y)
+        if abs(err_x_px) < DEADZONE_PX: err_x_px = 0
+        if abs(err_y_px) < DEADZONE_PX: err_y_px = 0
 
-        # Scale for ESP32 mapping
-        target_vel_x = int(np.clip(abs(out_x) * 5, 0, 255))
-        dir_x = 1 if out_x > 0 else 2
+        err_x_deg = err_x_px * (FOV_X / 640.0)
+        err_y_deg = err_y_px * (FOV_Y / 480.0)
 
-        target_vel_y = int(np.clip(abs(out_y) * 5, 0, 255))
-        dir_y = 1 if out_y > 0 else 2
-        
-        # Acceleration Smoothing to prevent vibration
-        speed_diff_x = target_vel_x - actual_vel_x
-        if abs(speed_diff_x) > MAX_ACCEL: actual_vel_x += np.sign(speed_diff_x) * MAX_ACCEL
-        else: actual_vel_x = target_vel_x
-            
-        speed_diff_y = target_vel_y - actual_vel_y
-        if abs(speed_diff_y) > MAX_ACCEL: actual_vel_y += np.sign(speed_diff_y) * MAX_ACCEL
-        else: actual_vel_y = target_vel_y
-            
-        vel_x, vel_y = int(actual_vel_x), int(actual_vel_y)
-        last_error_x, last_error_y = err_x, err_y
-        
+        motor_x_deg = err_x_deg * GEAR_RATIO_X
+        motor_y_deg = err_y_deg * GEAR_RATIO_Y
+
+        steps_x = abs(int(motor_x_deg / DEG_PER_STEP))
+        steps_y = abs(int(motor_y_deg / DEG_PER_STEP))
+
+        if not INVERT_X: dir_x = 1 if err_x_px > 0 else 2
+        else: dir_x = 2 if err_x_px > 0 else 1
+
+        if not INVERT_Y: dir_y = 1 if err_y_px > 0 else 2
+        else: dir_y = 2 if err_y_px > 0 else 1
+
+        if time.time() - last_tts_time > 6.0 and len(boxes) > 0:
+            target_list = [t.strip() for t in target_class.split(',')]
+            for name, coords, conf in boxes:
+                if name in target_list:
+                    audio_queue.put(('desc', (name, conf)))
+                    last_tts_time = time.time()
+                    break
     else:
-        # Smooth braking when target is lost
-        error_sum_x, error_sum_y = 0, 0
-        if actual_vel_x > 0: actual_vel_x = max(0, actual_vel_x - MAX_ACCEL * 1.5)
-        if actual_vel_y > 0: actual_vel_y = max(0, actual_vel_y - MAX_ACCEL * 1.5)
-        vel_x, vel_y = int(actual_vel_x), int(actual_vel_y)
 
-    # Send directly to C6 Firmware
-    esp32.write(f"{dir_x},{vel_x},{dir_y},{vel_y}\n".encode())
+        steps_x = abs(abs_pos_x)
+        steps_y = abs(abs_pos_y)
+
+        steps_x = min(steps_x, 150)
+        steps_y = min(steps_y, 150)
+
+        if not INVERT_X: dir_x = 2 if abs_pos_x > 0 else 1
+        else: dir_x = 1 if abs_pos_x > 0 else 2
+
+        if not INVERT_Y: dir_y = 2 if abs_pos_y > 0 else 1
+        else: dir_y = 1 if abs_pos_y > 0 else 2
+
+    max_steps_possible = int((dt * 1000.0) / STEP_DELAY_MS)
+
+    actual_move_x = min(steps_x, max_steps_possible)
+
+    pos_dir_x = 1 if not INVERT_X else 2
+    if actual_move_x > 0:
+        if dir_x == pos_dir_x: abs_pos_x += actual_move_x
+        else: abs_pos_x -= actual_move_x
+
+    actual_move_y = min(steps_y, max_steps_possible)
+    pos_dir_y = 1 if not INVERT_Y else 2
+    if actual_move_y > 0:
+        if dir_y == pos_dir_y: abs_pos_y += actual_move_y
+        else: abs_pos_y -= actual_move_y
+
+    if esp32:
+        esp32.write(f"{dir_x},{steps_x},{dir_y},{steps_y}\n".encode())
+
+    display = cv2.resize(frame_raw, (1280, 960), interpolation=cv2.INTER_NEAREST)
+    display = cv2.flip(display, 1)
+
+    scale_ui = 2.0
+    for name, coords, conf in boxes:
+        x1, y1, x2, y2 = [int(c * scale_ui) for c in coords]
+        x1_f, x2_f = 1280 - x2, 1280 - x1
+        cv2.rectangle(display, (x1_f, y1), (x2_f, y2), (0, 255, 0), 2)
+        cv2.putText(display, f"{name} {conf:.2f}", (x1_f, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    if found:
+        tx_f = 1280 - int(tx * scale_ui)
+        ty_f = int(ty * scale_ui)
+        cv2.circle(display, (tx_f, ty_f), 12, (0, 0, 255), -1)
+
+    elapsed = time.time() - loop_start
+    instant_fps = 1.0 / elapsed if elapsed > 0 else 60
+    current_fps = (current_fps * fps_smoothing) + (instant_fps * (1.0 - fps_smoothing))
+
+    cv2.putText(display, f"FPS: {current_fps:.1f} (Home Return Active)", (10, 30), 0, 0.7, (0, 255, 0), 2)
+    cv2.putText(display, f"Abs Pos X: {abs_pos_x} Y: {abs_pos_y}", (10, 60), 0, 0.6, (255, 255, 0), 2)
+
+    conn_text = "ESP32: CONNECTED" if esp32 else "ESP32: NOT CONNECTED"
+    cv2.putText(display, conn_text, (10, 90), 0, 0.6, (0, 255, 0) if esp32 else (0,0,255), 2)
+
+    if not found:
+        cv2.putText(display, "TARGET LOST - HOMING...", (10, 120), 0, 0.7, (0, 165, 255), 2)
+
+    cv2.imshow("Turret 60FPS Async", display)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cam.stop()
+cv2.destroyAllWindows()
+if esp32:
+    esp32.close()
+
