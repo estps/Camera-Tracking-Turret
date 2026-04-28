@@ -1,17 +1,21 @@
 import cv2
 import serial
+import socket
+import struct
 import time
 import numpy as np
 import threading
 import queue
 import pyttsx3
-from ultralytics import YOLO
+import math
 
 cv2.setNumThreads(8)
 
-SERIAL_PORT = '/dev/ttyACM0'  
+SERIAL_PORT = '/dev/ttyACM0'
+GX10_IP = 'IP'
+GX10_PORT = 5000
 
-GEAR_RATIO_X = 166.0 / 24.0 
+GEAR_RATIO_X = 166.0 / 24.0
 GEAR_RATIO_Y = 60.0 / 20.0
 
 FOV_X = 55.0
@@ -19,23 +23,31 @@ FOV_Y = 43.0
 
 STEPS_PER_REV = 400.0
 DEG_PER_STEP = 360.0 / STEPS_PER_REV  
+
 STEP_DELAY_MS = 0.6 
 
 INVERT_X = True
 INVERT_Y = False
 
-CENTER_X, CENTER_Y = 320, 240 
+CENTER_X, CENTER_Y = 320, 240
 DEADZONE_PX = 8  
 
-target_class = "person" 
+target_class = "person"
 
 abs_pos_x = 0 
-abs_pos_y = 0 
 
-print("Loading YOLO11 Models Locally (Auto-Detecting GPU/CPU)...")
+abs_pos_y = 0
 
-model_pose = YOLO("yolo11n-pose.pt") 
-model_obj = YOLO("yolo11x.pt")       
+ai_data = {
+    'tx': CENTER_X,
+    'ty': CENTER_Y,
+    'found': False,
+    'boxes': [],
+    'new_frame': None,
+    'in_flight': 0,
+    'kb_sent': 0,
+    'lock': threading.Lock()
+}
 
 audio_queue = queue.Queue()
 def audio_worker():
@@ -43,15 +55,15 @@ def audio_worker():
     try:
         engine = pyttsx3.init()
         engine.setProperty('rate', 180)
-    except: 
+    except:
         print("[ERROR] TTS Engine failed to initialize")
         pass
 
     while True:
         m, content = audio_queue.get()
         if engine:
-            if m == 'ding': 
-                print("\a") 
+            if m == 'ding':
+                print("\a")
                 engine.say("Locked")
             elif m == 'desc':
                 name, conf = content
@@ -63,20 +75,14 @@ def audio_worker():
 threading.Thread(target=audio_worker, daemon=True).start()
 
 class CameraStream:
-    def __init__(self, index=2): 
-
+    def __init__(self, index=2):
         self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FPS, 60)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) 
-
-        actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        print(f"\n[CAMERA] Native Format: {actual_w}x{actual_h} @ {actual_fps} FPS\n")
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
 
         self.ret, self.frame = False, None
         self.started = False
@@ -113,6 +119,85 @@ class CameraStream:
         self.thread.join()
         self.cap.release()
 
+def gx10_worker():
+    sock = None
+    def connect():
+        nonlocal sock
+        while True:
+            try:
+                if sock: sock.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(2.0)
+                sock.connect((GX10_IP, GX10_PORT))
+                sock.settimeout(None)
+                print("GX10 Connected.")
+                return sock
+            except: time.sleep(1)
+
+    sock = connect()
+
+    def receiver(current_sock):
+        buffer = ""
+        while True:
+            try:
+                chunk = current_sock.recv(4096).decode('utf-8')
+                if not chunk: break
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if "|" in line:
+                        parts = line.split('|')
+                        main = parts[0].split(',')
+                        new_tx, new_ty, new_found = int(main[0]), int(main[1]), bool(int(main[2]))
+
+                        boxes = []
+                        if len(parts) > 1 and parts[1]:
+                            for b in parts[1].split(';'):
+                                if not b: continue
+                                bp = b.split(',')
+                                if len(bp) >= 5:
+                                    try:
+                                        coords = [int(float(v)) for v in bp[1:5]]
+                                        conf = float(bp[5]) if len(bp) >= 6 else 1.0
+                                        boxes.append((bp[0], coords, conf))
+                                    except:
+                                        pass
+
+                        with ai_data['lock']:
+                            ai_data['tx'], ai_data['ty'], ai_data['found'] = new_tx, new_ty, new_found
+                            ai_data['boxes'] = boxes
+                            if ai_data['in_flight'] > 0: ai_data['in_flight'] -= 1
+            except: break
+
+    recv_thread = threading.Thread(target=receiver, args=(sock,), daemon=True)
+    recv_thread.start()
+
+    while True:
+        frame = None
+        with ai_data['lock']:
+            if ai_data['new_frame'] is not None:
+                frame = ai_data['new_frame']
+                ai_data['new_frame'] = None
+        if frame is None:
+            time.sleep(0.001); continue
+        try:
+            with ai_data['lock']: flights = ai_data['in_flight']
+            if flights < 2:
+                _, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                img_data = enc.tobytes()
+                header = target_class.encode('utf-8').ljust(16, b'\x00')[:16] + struct.pack('<I', len(img_data))
+                sock.sendall(header + img_data)
+                with ai_data['lock']:
+                    ai_data['kb_sent'] = len(img_data) / 1024
+                    ai_data['in_flight'] += 1
+        except:
+            sock = connect()
+            with ai_data['lock']: ai_data['in_flight'] = 0
+            threading.Thread(target=receiver, args=(sock,), daemon=True).start()
+
+threading.Thread(target=gx10_worker, daemon=True).start()
+
 def input_thread():
     global target_class
     while True:
@@ -133,55 +218,26 @@ last_tts_time = 0
 fps_smoothing = 0.9
 current_fps = 60.0
 
+steps_x, steps_y = 0, 0
+
 while True:
     loop_start = time.time()
     ret, frame_raw = cam.read()
     if not ret or frame_raw is None: continue
+    with ai_data['lock']: ai_data['new_frame'] = frame_raw
+    with ai_data['lock']:
+        tx, ty, found = ai_data['tx'], ai_data['ty'], ai_data['found']
+        boxes, flights, kb_size = ai_data['boxes'], ai_data['in_flight'], ai_data['kb_sent']
 
     now = time.time()
     dt = now - last_time
     last_time = now
 
-    tx, ty, found = CENTER_X, CENTER_Y, False
-    dir_x, dir_y = 1, 1 
+    dir_x, dir_y = 1, 1
     steps_x, steps_y = 0, 0
-    boxes_to_draw = []
-
-    target_list = [t.strip() for t in target_class.split(',')]
-    is_pose_mode = "person" in target_list
-
-    if is_pose_mode:
-
-        results = model_pose.predict(frame_raw, verbose=False, conf=0.45)
-        if results and results[0].keypoints:
-            kps = results[0].keypoints.xy.cpu().numpy()
-            confs = results[0].keypoints.conf.cpu().numpy() if results[0].keypoints.conf is not None else [0.9] * len(kps)
-            for i, person in enumerate(kps):
-                if len(person) > 0 and person[0][0] > 0:
-                    px, py = int(person[0][0]), int(person[0][1])
-                    if not found:
-                        tx, ty = px, py
-                        found = True
-                    conf = confs[i][0] if hasattr(confs[i], "__len__") else 0.9
-                    boxes_to_draw.append(("person", [px-50, py-50, px+50, py+50], conf))
-    else:
-
-        results = model_obj.predict(frame_raw, verbose=False, conf=0.45)
-        if results and results[0].boxes:
-            for box in results[0].boxes:
-                cls_id = int(box.cls[0])
-                cls_name = model_obj.names[cls_id]
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-
-                boxes_to_draw.append((cls_name, [x1, y1, x2, y2], conf))
-
-                if cls_name in target_list and not found:
-                    tx = int((x1 + x2) / 2)
-                    ty = int((y1 + y2) / 2)
-                    found = True
 
     if found:
+
         err_x_px = tx - CENTER_X
         err_y_px = ty - CENTER_Y
 
@@ -203,8 +259,9 @@ while True:
         if not INVERT_Y: dir_y = 1 if err_y_px > 0 else 2
         else: dir_y = 2 if err_y_px > 0 else 1
 
-        if time.time() - last_tts_time > 6.0 and len(boxes_to_draw) > 0:
-            for name, coords, conf in boxes_to_draw:
+        if time.time() - last_tts_time > 6.0 and len(boxes) > 0:
+            target_list = [t.strip() for t in target_class.split(',')]
+            for name, coords, conf in boxes:
                 if name in target_list:
                     audio_queue.put(('desc', (name, conf)))
                     last_tts_time = time.time()
@@ -226,6 +283,7 @@ while True:
     max_steps_possible = int((dt * 1000.0) / STEP_DELAY_MS)
 
     actual_move_x = min(steps_x, max_steps_possible)
+
     pos_dir_x = 1 if not INVERT_X else 2
     if actual_move_x > 0:
         if dir_x == pos_dir_x: abs_pos_x += actual_move_x
@@ -241,15 +299,17 @@ while True:
         esp32.write(f"{dir_x},{steps_x},{dir_y},{steps_y}\n".encode())
 
     display = cv2.resize(frame_raw, (1280, 960), interpolation=cv2.INTER_NEAREST)
+    display = cv2.flip(display, 1)
 
-    scale_ui = 2.0 
-    for name, coords, conf in boxes_to_draw:
+    scale_ui = 2.0
+    for name, coords, conf in boxes:
         x1, y1, x2, y2 = [int(c * scale_ui) for c in coords]
-        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(display, f"{name} {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        x1_f, x2_f = 1280 - x2, 1280 - x1
+        cv2.rectangle(display, (x1_f, y1), (x2_f, y2), (0, 255, 0), 2)
+        cv2.putText(display, f"{name} {conf:.2f}", (x1_f, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     if found:
-        tx_f = int(tx * scale_ui)
+        tx_f = 1280 - int(tx * scale_ui)
         ty_f = int(ty * scale_ui)
         cv2.circle(display, (tx_f, ty_f), 12, (0, 0, 255), -1)
 
@@ -257,7 +317,7 @@ while True:
     instant_fps = 1.0 / elapsed if elapsed > 0 else 60
     current_fps = (current_fps * fps_smoothing) + (instant_fps * (1.0 - fps_smoothing))
 
-    cv2.putText(display, f"FPS: {current_fps:.1f} (Local YOLO Mode)", (10, 30), 0, 0.7, (0, 255, 0), 2)
+    cv2.putText(display, f"FPS: {current_fps:.1f} (Home Return Active)", (10, 30), 0, 0.7, (0, 255, 0), 2)
     cv2.putText(display, f"Abs Pos X: {abs_pos_x} Y: {abs_pos_y}", (10, 60), 0, 0.6, (255, 255, 0), 2)
 
     conn_text = "ESP32: CONNECTED" if esp32 else "ESP32: NOT CONNECTED"
@@ -266,10 +326,11 @@ while True:
     if not found:
         cv2.putText(display, "TARGET LOST - HOMING...", (10, 120), 0, 0.7, (0, 165, 255), 2)
 
-    cv2.imshow("Turret Local AI", display)
+    cv2.imshow("Turret 60FPS Async", display)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 cam.stop()
 cv2.destroyAllWindows()
 if esp32:
     esp32.close()
+
