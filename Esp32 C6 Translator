@@ -1,10 +1,10 @@
 #include <Arduino.h>
 
-#define YAW_STEP 23
-#define YAW_DIR 15
+#define YAW_STEP 21
+#define YAW_DIR 22
 
-#define PITCH_STEP 21
-#define PITCH_DIR 22
+#define PITCH_STEP 23
+#define PITCH_DIR 15
 
 unsigned long lastMicrosX = 0;
 unsigned long lastMicrosY = 0;
